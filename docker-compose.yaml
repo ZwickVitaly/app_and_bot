@@ -1,0 +1,137 @@
+services:
+
+  init-dhparams:
+    image: docker.io/certbot/certbot
+    restart: "no"
+    entrypoint: /bin/sh
+    env_file:
+      - .env
+    command: -c 'test -f /etc/letsencrypt/ssl-dhparams.pem || openssl dhparam -out /etc/letsencrypt/ssl-dhparams.pem 4096'
+    volumes:
+      - ./cert_volume:/etc/letsencrypt:Z
+
+  certbot-oneshot:
+    image: docker.io/certbot/certbot
+    restart: "no"
+    entrypoint: /bin/sh
+    env_file:
+      - .env
+    command: -c 'test -d /etc/letsencrypt/live/${BASE_DOMAIN} || certbot certonly --standalone --register-unsafely-without-email -d "${BASE_DOMAIN},www.${BASE_DOMAIN}" --rsa-key-size 2048 --agree-tos --force-renewal'
+    ports:
+      - 80:80
+    volumes:
+      - ./cert_volume:/etc/letsencrypt:Z
+    depends_on:
+      init-dhparams:
+        condition: service_completed_successfully
+        required: true
+
+  mongo:
+    image: mongo
+    container_name: mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+    command: mongod --quiet --logpath /dev/null
+    env_file:
+      - .env
+    volumes:
+      - ./app_data:/data/db
+    healthcheck:
+      test: [ "CMD","mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  redis:
+    container_name: redis
+    image: redis:latest
+    healthcheck:
+      test: [ "CMD-SHELL", "redis-cli ping | grep PONG" ]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  api_app:
+    container_name: api_app
+    build:
+      dockerfile: ./api_app/Dockerfile_api_app
+    command:
+      - "uvicorn app:app --host 0.0.0.0 --port 8080"
+    restart: on-failure
+    volumes:
+      - ./app_data/logs/api_app:/api_app/logs
+    env_file:
+      - .env
+    depends_on:
+      mongo:
+        condition: service_healthy
+        required: true
+      redis:
+        condition: service_healthy
+        required: true
+  bot:
+    container_name: bot
+    build:
+      dockerfile: ./bot/Dockerfile_bot
+    command:
+      - "python3 main.py"
+    restart: on-failure
+    env_file:
+      - .env
+    volumes:
+      - ./app_data/logs/bot:/bot/logs
+    depends_on:
+      mongo:
+        condition: service_healthy
+        required: true
+      redis:
+        condition: service_healthy
+        required: true
+
+
+  nginx:
+    container_name: nginx
+    restart: on-failure
+    image: nginx
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./app_data/logs/nginx:/var/log/nginx
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template
+      - ./cert_volume:/etc/letsencrypt:Z
+    depends_on:
+      init-dhparams:
+        condition: service_completed_successfully
+        required: true
+      certbot-oneshot:
+        condition: service_completed_successfully
+        required: true
+      api_app:
+        condition: service_started
+        required: true
+    healthcheck:
+      test: curl --fail http://localhost || exit 1
+      interval: 60s
+      retries: 5
+      start_period: 15s
+      timeout: 10s
+
+  certbot:
+    image: docker.io/certbot/certbot
+    entrypoint: /bin/sh
+    command: -c 'trap exit TERM; while :; do certbot renew; sleep 24h && wait $${!}; done;'
+    depends_on:
+      nginx:
+        condition: service_healthy
+        required: true
+    volumes:
+      - ./cert_volume:/etc/letsencrypt:Z
+      - ./acme_challenge:/usr/share/nginx/html/.well-known:Z
+
